@@ -46,7 +46,9 @@ class LMDBDataset(Dataset):
 
         config = config_from_atoms(
             atoms,
-            key_specification=KeySpecification.from_defaults(),
+            key_specification=self.kwargs.get(
+                "key_specification", KeySpecification.from_defaults()
+            ),
         )
 
         # Set head if not already set

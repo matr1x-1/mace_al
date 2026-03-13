@@ -664,6 +664,15 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         default=DefaultKeys.FORCES.value,
     )
     parser.add_argument(
+        "--forces_loss_mask_key",
+        help=(
+            "Optional per-atom array key used to mask or weight the force loss. "
+            "Atoms with value 0 are ignored in the force loss and force metrics."
+        ),
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
         "--virials_key",
         help="Key of reference virials in training xyz",
         type=str,
@@ -1180,6 +1189,15 @@ def build_preprocess_arg_parser() -> argparse.ArgumentParser:
         help="Key of reference forces in training xyz",
         type=str,
         default=DefaultKeys.FORCES.value,
+    )
+    parser.add_argument(
+        "--forces_loss_mask_key",
+        help=(
+            "Optional per-atom array key used to mask or weight the force loss. "
+            "Atoms with value 0 are ignored in the force loss and force metrics."
+        ),
+        type=str,
+        default=None,
     )
     parser.add_argument(
         "--virials_key",

@@ -395,6 +395,25 @@ class AtomicData(torch_geometric.data.Data):
             if config.properties.get("density_coefficients") is not None
             else torch.zeros(num_atoms, 1, dtype=torch.get_default_dtype())
         )
+        forces_loss_mask = config.properties.get("forces_loss_mask")
+        if "forces_loss_mask" in config.properties:
+            if forces_loss_mask is None:
+                forces_loss_mask = torch.ones(
+                    num_atoms, 1, dtype=torch.get_default_dtype()
+                )
+            else:
+                forces_loss_mask = torch.as_tensor(forces_loss_mask)
+                if len(forces_loss_mask.shape) == 1:
+                    forces_loss_mask = forces_loss_mask.unsqueeze(-1)
+                if forces_loss_mask.shape != (num_atoms, 1):
+                    raise ValueError(
+                        "forces_loss_mask must have shape (num_atoms,) or (num_atoms, 1)"
+                    )
+                forces_loss_mask = forces_loss_mask.to(
+                    dtype=torch.get_default_dtype()
+                    if forces_loss_mask.dtype.is_floating_point
+                    else forces_loss_mask.dtype
+                )
 
         cls_kwargs = dict(
             edge_index=torch.tensor(edge_index, dtype=torch.long),
@@ -429,6 +448,8 @@ class AtomicData(torch_geometric.data.Data):
             fermi_level=fermi_level,
             external_field=external_field,
         )
+        if "forces_loss_mask" in config.properties:
+            cls_kwargs["forces_loss_mask"] = forces_loss_mask
 
         # Pass through any extra properties not already handled above.
         for k, v in config.properties.items():

@@ -169,6 +169,61 @@ def test_weighted_loss(config, table):
     assert out2 == 0.0
 
 
+def test_force_loss_mask_ignores_unselected_atoms(config, table):
+    config.properties["forces_loss_mask"] = np.array([1.0, 0.0, 0.0])
+    config.property_weights["forces_loss_mask"] = 1.0
+
+    data = AtomicData.from_config(config, z_table=table, cutoff=3.0)
+    data_loader = torch_geometric.dataloader.DataLoader(
+        dataset=[data],
+        batch_size=1,
+        shuffle=False,
+        drop_last=False,
+    )
+    batch = next(iter(data_loader))
+    pred_forces = batch.forces.clone()
+    pred_forces[1:] += 2.0
+    pred = {
+        "energy": batch.energy,
+        "forces": pred_forces,
+        "stress": batch.stress,
+    }
+
+    mse_loss = WeightedEnergyForcesLoss(energy_weight=0.0, forces_weight=1.0)
+    huber_loss = WeightedHuberEnergyForcesStressLoss(
+        energy_weight=0.0, forces_weight=1.0, stress_weight=0.0
+    )
+
+    assert torch.isclose(mse_loss(batch, pred), torch.tensor(0.0))
+    assert torch.isclose(huber_loss(batch, pred), torch.tensor(0.0))
+
+
+def test_force_loss_mask_reduces_only_over_selected_atoms(config, table):
+    config.properties["forces_loss_mask"] = np.array([1.0, 0.0, 0.0])
+    config.property_weights["forces_loss_mask"] = 1.0
+
+    data = AtomicData.from_config(config, z_table=table, cutoff=3.0)
+    batch = next(
+        iter(
+            torch_geometric.dataloader.DataLoader(
+                dataset=[data],
+                batch_size=1,
+                shuffle=False,
+                drop_last=False,
+            )
+        )
+    )
+    pred = {
+        "energy": batch.energy,
+        "forces": batch.forces + 1.0,
+        "stress": batch.stress,
+    }
+
+    loss = WeightedEnergyForcesLoss(energy_weight=0.0, forces_weight=1.0)(batch, pred)
+
+    assert torch.isclose(loss, torch.tensor(1.0))
+
+
 def test_symmetric_contraction():
     operation = SymmetricContraction(
         irreps_in=o3.Irreps("16x0e + 16x1o + 16x2e"),

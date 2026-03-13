@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 
 from mace.tools import TensorDict
+from mace.tools.utils import get_forces_loss_mask
 from mace.tools.torch_geometric import Batch
 
 
@@ -41,6 +42,40 @@ def reduce_loss(raw_loss: torch.Tensor, ddp: Optional[bool] = None) -> torch.Ten
         dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
         return loss_sum * world_size / total_samples
     return raw_loss.mean()
+
+
+def get_masked_forces_loss_mask(ref: Batch, like: torch.Tensor) -> torch.Tensor:
+    mask = get_forces_loss_mask(ref)
+    if mask is None:
+        mask = torch.ones(
+            like.shape[0],
+            1,
+            device=like.device,
+            dtype=like.dtype,
+        )
+    else:
+        mask = mask.to(device=like.device, dtype=like.dtype)
+    if torch.any(mask < 0):
+        raise ValueError("forces_loss_mask must be non-negative")
+    if like.ndim == 1:
+        return mask.squeeze(-1)
+    return mask
+
+
+def reduce_masked_loss(
+    raw_loss: torch.Tensor, mask: torch.Tensor, ddp: Optional[bool] = None
+) -> torch.Tensor:
+    ddp = is_ddp_enabled() if ddp is None else ddp
+    if mask.shape != raw_loss.shape:
+        mask = mask * torch.ones_like(raw_loss)
+    denom = mask.sum()
+    eps = torch.finfo(raw_loss.dtype).eps
+    if ddp and dist.is_initialized():
+        world_size = dist.get_world_size()
+        total_mask = denom.clone()
+        dist.all_reduce(total_mask, op=dist.ReduceOp.SUM)
+        return raw_loss.sum() * world_size / torch.clamp_min(total_mask, eps)
+    return raw_loss.sum() / torch.clamp_min(denom, eps)
 
 
 # ------------------------------------------------------------------------------
@@ -127,19 +162,27 @@ def mean_squared_error_forces(
     configs_forces_weight = torch.repeat_interleave(
         ref.forces_weight, ref.ptr[1:] - ref.ptr[:-1]
     ).unsqueeze(-1)
+    forces_loss_mask = get_masked_forces_loss_mask(ref, ref["forces"])
     raw_loss = (
         configs_weight
         * configs_forces_weight
+        * forces_loss_mask
         * torch.square(ref["forces"] - pred["forces"])
     )
-    return reduce_loss(raw_loss, ddp)
+    return reduce_masked_loss(raw_loss, forces_loss_mask, ddp)
 
 
 def mean_normed_error_forces(
     ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
 ) -> torch.Tensor:
-    raw_loss = torch.linalg.vector_norm(ref["forces"] - pred["forces"], ord=2, dim=-1)
-    return reduce_loss(raw_loss, ddp)
+    forces_loss_mask = get_masked_forces_loss_mask(
+        ref, ref["forces"]
+    ).squeeze(-1)
+    raw_loss = (
+        forces_loss_mask
+        * torch.linalg.vector_norm(ref["forces"] - pred["forces"], ord=2, dim=-1)
+    )
+    return reduce_masked_loss(raw_loss, forces_loss_mask, ddp)
 
 
 # ------------------------------------------------------------------------------
@@ -190,6 +233,7 @@ def conditional_mse_forces(
     configs_forces_weight = torch.repeat_interleave(
         ref.forces_weight, ref.ptr[1:] - ref.ptr[:-1]
     ).unsqueeze(-1)
+    forces_loss_mask = get_masked_forces_loss_mask(ref, ref["forces"])
     # Define multiplication factors for different regimes.
     factors = torch.tensor(
         [1.0, 0.7, 0.4, 0.1], device=ref["forces"].device, dtype=ref["forces"].dtype
@@ -204,14 +248,15 @@ def conditional_mse_forces(
     se[c2] = torch.square(err[c2]) * factors[1]
     se[c3] = torch.square(err[c3]) * factors[2]
     se[~(c1 | c2 | c3)] = torch.square(err[~(c1 | c2 | c3)]) * factors[3]
-    raw_loss = configs_weight * configs_forces_weight * se
-    return reduce_loss(raw_loss, ddp)
+    raw_loss = configs_weight * configs_forces_weight * forces_loss_mask * se
+    return reduce_masked_loss(raw_loss, forces_loss_mask, ddp)
 
 
 def conditional_huber_forces(
     ref_forces: torch.Tensor,
     pred_forces: torch.Tensor,
     huber_delta: float,
+    forces_loss_mask: Optional[torch.Tensor] = None,
     ddp: Optional[bool] = None,
 ) -> torch.Tensor:
     factors = huber_delta * torch.tensor(
@@ -235,7 +280,10 @@ def conditional_huber_forces(
     se[c4] = torch.nn.functional.huber_loss(
         ref_forces[c4], pred_forces[c4], reduction="none", delta=factors[3]
     )
-    return reduce_loss(se, ddp)
+    if forces_loss_mask is None:
+        return reduce_loss(se, ddp)
+    raw_loss = forces_loss_mask * se
+    return reduce_masked_loss(raw_loss, forces_loss_mask, ddp)
 
 
 # ------------------------------------------------------------------------------
@@ -346,6 +394,7 @@ class WeightedHuberEnergyForcesStressLoss(torch.nn.Module):
         self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
     ) -> torch.Tensor:
         num_atoms = ref.ptr[1:] - ref.ptr[:-1]
+        forces_loss_mask = get_masked_forces_loss_mask(ref, ref["forces"])
         if ddp:
             loss_energy = torch.nn.functional.huber_loss(
                 ref["energy"] / num_atoms,
@@ -357,7 +406,9 @@ class WeightedHuberEnergyForcesStressLoss(torch.nn.Module):
             loss_forces = torch.nn.functional.huber_loss(
                 ref["forces"], pred["forces"], reduction="none", delta=self.huber_delta
             )
-            loss_forces = reduce_loss(loss_forces, ddp)
+            loss_forces = reduce_masked_loss(
+                forces_loss_mask * loss_forces, forces_loss_mask, ddp
+            )
             loss_stress = torch.nn.functional.huber_loss(
                 ref["stress"], pred["stress"], reduction="none", delta=self.huber_delta
             )
@@ -369,8 +420,16 @@ class WeightedHuberEnergyForcesStressLoss(torch.nn.Module):
                 reduction="mean",
                 delta=self.huber_delta,
             )
-            loss_forces = torch.nn.functional.huber_loss(
-                ref["forces"], pred["forces"], reduction="mean", delta=self.huber_delta
+            loss_forces = reduce_masked_loss(
+                forces_loss_mask
+                * torch.nn.functional.huber_loss(
+                    ref["forces"],
+                    pred["forces"],
+                    reduction="none",
+                    delta=self.huber_delta,
+                ),
+                forces_loss_mask,
+                ddp,
             )
             loss_stress = torch.nn.functional.huber_loss(
                 ref["stress"], pred["stress"], reduction="mean", delta=self.huber_delta
@@ -416,6 +475,7 @@ class UniversalLoss(torch.nn.Module):
         configs_forces_weight = torch.repeat_interleave(
             ref.forces_weight, ref.ptr[1:] - ref.ptr[:-1]
         ).unsqueeze(-1)
+        forces_loss_mask = get_masked_forces_loss_mask(ref, ref["forces"])
         if ddp:
             loss_energy = torch.nn.functional.huber_loss(
                 configs_energy_weight * ref["energy"] / num_atoms,
@@ -428,6 +488,7 @@ class UniversalLoss(torch.nn.Module):
                 configs_forces_weight * ref["forces"],
                 configs_forces_weight * pred["forces"],
                 huber_delta=self.huber_delta,
+                forces_loss_mask=forces_loss_mask,
                 ddp=ddp,
             )
             loss_stress = torch.nn.functional.huber_loss(
@@ -448,6 +509,7 @@ class UniversalLoss(torch.nn.Module):
                 configs_forces_weight * ref["forces"],
                 configs_forces_weight * pred["forces"],
                 huber_delta=self.huber_delta,
+                forces_loss_mask=forces_loss_mask,
                 ddp=ddp,
             )
             loss_stress = torch.nn.functional.huber_loss(

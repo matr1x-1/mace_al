@@ -172,6 +172,24 @@ def get_cache_dir() -> Path:
     return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "mace"
 
 
+def get_forces_loss_mask(batch) -> Optional[torch.Tensor]:
+    if not hasattr(batch, "forces_loss_mask") or batch.forces_loss_mask is None:
+        return None
+
+    mask = batch.forces_loss_mask
+    if len(mask.shape) == 1:
+        mask = mask.unsqueeze(-1)
+    if len(mask.shape) != 2 or mask.shape[1] != 1:
+        raise ValueError(
+            "forces_loss_mask must have shape (num_atoms,) or (num_atoms, 1)"
+        )
+    if mask.shape[0] != batch.forces.shape[0]:
+        raise ValueError(
+            "forces_loss_mask must contain one entry per atom in the batched forces"
+        )
+    return mask
+
+
 def filter_nonzero_weight(
     batch,
     quantity_l,
@@ -189,6 +207,9 @@ def filter_nonzero_weight(
         quantity_weight = torch.repeat_interleave(
             quantity_weight, batch.ptr[1:] - batch.ptr[:-1]
         ).unsqueeze(-1)
+        atom_mask = get_forces_loss_mask(batch)
+    else:
+        atom_mask = None
 
     # repeat for additional dimensions
     if len(quantity.shape) > 1:
@@ -197,7 +218,15 @@ def filter_nonzero_weight(
         weight = weight.view(*view).repeat(*repeats)
         if spread_quantity_vector:
             quantity_weight = quantity_weight.view(*view).repeat(*repeats)
-    filtered_q = quantity[weight * quantity_weight > 0]
+        if atom_mask is not None:
+            atom_mask = atom_mask.view(*view).repeat(*repeats)
+    elif atom_mask is not None:
+        atom_mask = atom_mask.squeeze(-1)
+
+    mask = weight * quantity_weight > 0
+    if atom_mask is not None:
+        mask = mask & (atom_mask > 0)
+    filtered_q = quantity[mask]
 
     if len(filtered_q) == 0:
         quantity_l.pop()

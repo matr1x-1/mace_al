@@ -11,6 +11,7 @@ from mace.data import (
     AtomicData,
     Configuration,
     HDF5Dataset,
+    KeySpecification,
     config_from_atoms,
     get_neighborhood,
     save_configurations_as_HDF5,
@@ -56,6 +57,31 @@ class TestAtomicData:
         assert data.edge_index.shape == (2, 4)
         assert data.forces.shape == (3, 3)
         assert data.node_attrs.shape == (3, 2)
+
+    def test_atomic_data_forces_loss_mask(self):
+        config = deepcopy(self.config)
+        config.properties["forces_loss_mask"] = np.array([1.0, 0.0, 1.0])
+        config.property_weights["forces_loss_mask"] = 1.0
+
+        data = AtomicData.from_config(config, z_table=self.table, cutoff=3.0)
+
+        assert data.forces_loss_mask.shape == (3, 1)
+        assert torch.allclose(
+            data.forces_loss_mask,
+            torch.tensor([[1.0], [0.0], [1.0]], dtype=torch.get_default_dtype()),
+        )
+
+    def test_atomic_data_missing_forces_loss_mask_defaults_to_ones(self):
+        config = deepcopy(self.config)
+        config.properties["forces_loss_mask"] = None
+        config.property_weights["forces_loss_mask"] = 1.0
+
+        data = AtomicData.from_config(config, z_table=self.table, cutoff=3.0)
+
+        assert torch.allclose(
+            data.forces_loss_mask,
+            torch.ones((3, 1), dtype=torch.get_default_dtype()),
+        )
 
     @pytest.mark.parametrize("num_workers", [0, 2])
     def test_data_loader(self, num_workers):
@@ -218,4 +244,29 @@ def test_half_periodic():
     assert np.allclose(
         vectors[:, 2],
         np.zeros(vectors.shape[0]),
+    )
+
+
+def test_config_from_atoms_reads_forces_loss_mask_key():
+    atoms = ase.build.molecule("H2O")
+    atoms.arrays["REF_forces"] = np.arange(9, dtype=float).reshape(3, 3)
+    atoms.arrays["REF_forces_mask"] = np.array([1.0, 0.0, 1.0])
+    key_specification = KeySpecification(
+        arrays_keys={
+            "forces": "REF_forces",
+            "forces_loss_mask": "REF_forces_mask",
+        }
+    )
+
+    config = config_from_atoms(atoms, key_specification=key_specification)
+
+    assert np.array_equal(
+        config.properties["forces_loss_mask"], np.array([1.0, 0.0, 1.0])
+    )
+    data = AtomicData.from_config(
+        config, z_table=AtomicNumberTable([1, 8]), cutoff=3.0
+    )
+    assert torch.allclose(
+        data.forces_loss_mask,
+        torch.tensor([[1.0], [0.0], [1.0]], dtype=torch.get_default_dtype()),
     )
