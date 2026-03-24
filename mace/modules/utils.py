@@ -15,6 +15,7 @@ from scipy.constants import c, e
 from mace.tools import to_numpy
 from mace.tools.scatter import scatter_mean, scatter_std, scatter_sum
 from mace.tools.torch_geometric.batch import Batch
+from mace.tools.utils import get_forces_loss_mask
 
 from .blocks import AtomicEnergiesBlock
 
@@ -352,6 +353,7 @@ def compute_mean_rms_energy_forces(
 
     atom_energy_list = []
     forces_list = []
+    force_mask_list = []
     head_list = []
     head_batch = []
 
@@ -366,22 +368,24 @@ def compute_mean_rms_energy_forces(
             (batch.energy - graph_e0s) / graph_sizes
         )  # {[n_graphs], }
         forces_list.append(batch.forces)  # {[n_graphs*n_atoms,3], }
+        force_mask_list.append(get_forces_loss_mask(batch))
         head_list.append(head)
         head_batch.append(head[batch.batch])
 
     atom_energies = torch.cat(atom_energy_list, dim=0)  # [total_n_graphs]
     forces = torch.cat(forces_list, dim=0)  # {[total_n_graphs*n_atoms,3], }
+    force_mask = (
+        torch.cat(force_mask_list, dim=0)
+        if any(mask is not None for mask in force_mask_list)
+        else None
+    )
     head = torch.cat(head_list, dim=0)  # [total_n_graphs]
     head_batch = torch.cat(head_batch, dim=0)  # [total_n_graphs]
 
     # mean = to_numpy(torch.mean(atom_energies)).item()
     # rms = to_numpy(torch.sqrt(torch.mean(torch.square(forces)))).item()
     mean = to_numpy(scatter_mean(src=atom_energies, index=head, dim=0).squeeze(-1))
-    rms = to_numpy(
-        torch.sqrt(
-            scatter_mean(src=torch.square(forces), index=head_batch, dim=0).mean(-1)
-        )
-    )
+    rms = _compute_force_rms(forces, head_batch, force_mask)
     rms = _check_non_zero(rms)
 
     return mean, rms
@@ -401,6 +405,31 @@ def _compute_mean_rms_energy_forces(
     forces = batch.forces  # {[n_graphs*n_atoms,3], }
 
     return atom_energies, forces
+
+
+def _compute_force_rms(
+    forces: torch.Tensor,
+    head_batch: torch.Tensor,
+    force_mask: Optional[torch.Tensor] = None,
+) -> np.ndarray:
+    if force_mask is None:
+        return to_numpy(
+            torch.sqrt(
+                scatter_mean(src=torch.square(forces), index=head_batch, dim=0).mean(
+                    -1
+                )
+            )
+        )
+
+    force_mask = force_mask.to(device=forces.device, dtype=forces.dtype)
+    sq_sum = scatter_sum(
+        src=torch.square(forces) * force_mask, index=head_batch, dim=0
+    )
+    mask_sum = scatter_sum(
+        src=force_mask * torch.ones_like(forces), index=head_batch, dim=0
+    )
+    eps = torch.finfo(forces.dtype).eps
+    return to_numpy(torch.sqrt((sq_sum / torch.clamp_min(mask_sum, eps)).mean(-1)))
 
 
 def compute_avg_num_neighbors(data_loader: torch.utils.data.DataLoader) -> float:
@@ -424,6 +453,7 @@ def compute_statistics(
 
     atom_energy_list = []
     forces_list = []
+    force_mask_list = []
     num_neighbors = []
     head_list = []
     head_batch = []
@@ -439,6 +469,7 @@ def compute_statistics(
             (batch.energy - graph_e0s) / graph_sizes
         )  # {[n_graphs], }
         forces_list.append(batch.forces)  # {[n_graphs*n_atoms,3], }
+        force_mask_list.append(get_forces_loss_mask(batch))
         head_list.append(head)  # {[n_graphs], }
         head_batch.append(head[batch.batch])
         _, receivers = batch.edge_index
@@ -447,16 +478,18 @@ def compute_statistics(
 
     atom_energies = torch.cat(atom_energy_list, dim=0)  # [total_n_graphs]
     forces = torch.cat(forces_list, dim=0)  # {[total_n_graphs*n_atoms,3], }
+    force_mask = (
+        torch.cat(force_mask_list, dim=0)
+        if any(mask is not None for mask in force_mask_list)
+        else None
+    )
     head = torch.cat(head_list, dim=0)  # [total_n_graphs]
     head_batch = torch.cat(head_batch, dim=0)  # [total_n_graphs]
 
     # mean = to_numpy(torch.mean(atom_energies)).item()
     mean = to_numpy(scatter_mean(src=atom_energies, index=head, dim=0).squeeze(-1))
-    rms = to_numpy(
-        torch.sqrt(
-            scatter_mean(src=torch.square(forces), index=head_batch, dim=0).mean(-1)
-        )
-    )
+    rms = _compute_force_rms(forces, head_batch, force_mask)
+    rms = _check_non_zero(rms)
 
     avg_num_neighbors = torch.mean(
         torch.cat(num_neighbors, dim=0).type(torch.get_default_dtype())

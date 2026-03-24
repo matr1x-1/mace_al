@@ -12,6 +12,7 @@
 - [MACE](#mace)
   - [Table of contents](#table-of-contents)
   - [About MACE](#about-mace)
+  - [Latest Changes](#latest-changes)
   - [Documentation](#documentation)
   - [Installation](#installation)
     - [pip installation](#installation-from-pypi)
@@ -47,6 +48,45 @@ Also available:
 
 - [MACE in JAX](https://github.com/ACEsuit/mace-jax), currently about 2x times faster at evaluation, but training is recommended in Pytorch for optimal performances.
 - [MACE layers](https://github.com/ACEsuit/mace-layer) for constructing higher order equivariant graph neural networks for arbitrary 3D point clouds.
+
+## Latest Changes
+
+### Atom-selective force loss masking
+
+The latest commit, `277e7d1` (`Add atom-selective force loss masking`), adds optional per-atom masking and weighting for force supervision.
+
+If your dataset provides a `forces_loss_mask` array for each structure:
+
+- atoms with mask value `0` are excluded from the force loss and from force error metrics
+- positive mask values are kept and can be used as per-atom weights
+- negative values are rejected
+- accepted shapes are `(num_atoms,)` or `(num_atoms, 1)`
+
+This is now wired through:
+
+- `AtomicData.from_config(...)` for ASE-readable datasets
+- LMDB loading via `key_specification`
+- training and preprocessing CLIs through `--forces_loss_mask_key`
+- masked force losses, including MSE, norm-based, conditional, and Huber variants
+- metric filtering, so reported force statistics follow the same mask
+
+Example:
+
+```python
+atoms.arrays["REF_forces"] = ref_forces
+atoms.arrays["REF_forces_mask"] = np.array([1.0, 0.0, 1.0])
+```
+
+```sh
+mace_run_train \
+    --train_file=train.xyz \
+    --forces_key=REF_forces \
+    --forces_loss_mask_key=REF_forces_mask
+```
+
+This is useful when only a subset of atoms should contribute to force supervision, for example adsorbates on fixed slabs, QM/MM-style setups, or partially labeled datasets.
+
+The change is covered by new tests for dataset parsing and masked loss reduction.
 
 ## Documentation
 

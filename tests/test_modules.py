@@ -17,6 +17,7 @@ from mace.modules import (
 )
 from mace.tools import AtomicNumberTable, scatter, to_numpy, torch_geometric
 from mace.tools.scripts_utils import dict_to_array
+from mace.tools.train import MACELoss
 
 
 @pytest.fixture(name="config")
@@ -309,6 +310,26 @@ def test_compute_mean_rms_energy_forces_multi_head(data_loader, atomic_energies)
     assert rms[0] != rms[1]
 
 
+def test_compute_mean_rms_energy_forces_respects_force_loss_mask(config, table):
+    config.properties["forces_loss_mask"] = np.array([1.0, 0.0, 0.0])
+    config.property_weights["forces_loss_mask"] = 1.0
+
+    data = AtomicData.from_config(config, z_table=table, cutoff=3.0)
+    data_loader = torch_geometric.dataloader.DataLoader(
+        dataset=[data],
+        batch_size=1,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    mean, rms = compute_mean_rms_energy_forces(data_loader, np.array([0.0, 0.0]))
+
+    assert np.ndim(mean) == 0
+    assert rms.shape == (1,)
+    assert np.isclose(mean, -0.5)
+    assert np.isclose(rms[0], np.sqrt(np.mean(np.square([0.0, -1.3, 0.0]))))
+
+
 def test_compute_statistics(data_loader, atomic_energies):
     avg_num_neighbors, mean, std = compute_statistics(data_loader, atomic_energies)
     assert isinstance(avg_num_neighbors, float)
@@ -321,3 +342,63 @@ def test_compute_statistics(data_loader, atomic_energies):
     assert np.all(std > 0)
     assert mean[0] != mean[1]
     assert std[0] != std[1]
+
+
+def test_compute_statistics_respects_force_loss_mask(config, table):
+    config.properties["forces_loss_mask"] = np.array([1.0, 0.0, 0.0])
+    config.property_weights["forces_loss_mask"] = 1.0
+
+    data = AtomicData.from_config(config, z_table=table, cutoff=3.0)
+    data_loader = torch_geometric.dataloader.DataLoader(
+        dataset=[data],
+        batch_size=1,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    avg_num_neighbors, mean, std = compute_statistics(
+        data_loader, np.array([0.0, 0.0])
+    )
+
+    assert avg_num_neighbors > 0
+    assert np.ndim(mean) == 0
+    assert std.shape == (1,)
+    assert np.isclose(mean, -0.5)
+    assert np.isclose(std[0], np.sqrt(np.mean(np.square([0.0, -1.3, 0.0]))))
+
+
+def test_mace_loss_force_metrics_respect_force_loss_mask(config, table):
+    config.properties["forces_loss_mask"] = np.array([1.0, 0.0, 0.0])
+    config.property_weights["forces_loss_mask"] = 1.0
+
+    data = AtomicData.from_config(config, z_table=table, cutoff=3.0)
+    batch = next(
+        iter(
+            torch_geometric.dataloader.DataLoader(
+                dataset=[data],
+                batch_size=1,
+                shuffle=False,
+                drop_last=False,
+            )
+        )
+    )
+    pred = {
+        "energy": batch.energy,
+        "forces": batch.forces + 1.0,
+        "stress": batch.stress,
+    }
+
+    metrics = MACELoss(WeightedEnergyForcesLoss(energy_weight=0.0, forces_weight=1.0))
+    metrics.update(batch, pred)
+    loss, aux = metrics.compute()
+
+    selected_forces = to_numpy(batch.forces[:1])
+    expected_rel_mae = 100.0 / np.mean(np.abs(selected_forces))
+    expected_rel_rmse = 100.0 / np.sqrt(np.mean(np.square(selected_forces)))
+
+    assert np.isclose(loss, 1.0)
+    assert np.isclose(aux["mae_f"], 1.0)
+    assert np.isclose(aux["rmse_f"], 1.0)
+    assert np.isclose(aux["rel_mae_f"], expected_rel_mae)
+    assert np.isclose(aux["rel_rmse_f"], expected_rel_rmse)
+    assert np.isclose(aux["q95_f"], 1.0)

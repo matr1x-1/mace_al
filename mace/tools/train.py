@@ -642,6 +642,13 @@ class MACELoss(Metric):
                 batch.forces_weight,
                 spread_atoms=True,
             )
+            filter_nonzero_weight(
+                batch,
+                self.fs,
+                batch.weight,
+                batch.forces_weight,
+                spread_atoms=True,
+            )
         if output.get("stress") is not None and batch.stress is not None:
             self.delta_stress.append(batch.stress - output["stress"])
             self.stress_computed += filter_nonzero_weight(
